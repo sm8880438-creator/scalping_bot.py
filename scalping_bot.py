@@ -45,8 +45,8 @@ MAX_HOLD_MINUTES = 5         # max 5 min hold
 
 # ATR based SL/TP — tight
 ATR_PERIOD       = 7         # fast ATR
-ATR_SL_MULT      = 0.5       # tight SL
-ATR_TP_MULT      = 1.0       # quick TP
+ATR_SL_MULT      = 1.5       # tight SL
+ATR_TP_MULT      = 3.0       # quick TP
 
 # TP Early Exit
 TP_EXIT_MIN_PCT   = 0.65
@@ -265,33 +265,49 @@ def detect_structure(df, swing_bars=3):
 #  LIQUIDITY
 # ─────────────────────────────────────────────
 def detect_liquidity(df, lookback=30):
+    """
+    Improved liquidity detection:
+    - Swing bars 3 → 2 (zyada swings detect honge)
+    - Recent window bada kiya 3 → 5
+    - Tolerance add ki
+    """
     recent        = df.tail(lookback)
     highs         = recent["high"].values
     lows          = recent["low"].values
     current_price = df["close"].iloc[-1]
     n             = len(highs)
-    swing_bars    = 3
+    swing_bars    = 2            # 3 se 2 kiya
     buy_liquidity  = []
     sell_liquidity = []
+
     for i in range(swing_bars, n - swing_bars):
         if highs[i] == max(highs[i - swing_bars: i + swing_bars + 1]):
             buy_liquidity.append(highs[i])
         if lows[i] == min(lows[i - swing_bars: i + swing_bars + 1]):
             sell_liquidity.append(lows[i])
+
     buy_swept  = False
     sell_swept = False
+
     if buy_liquidity:
         last_high = buy_liquidity[-1]
-        recent_3  = df.tail(3)
-        if any(recent_3["high"] > last_high) and current_price < last_high:
+        recent_5  = df.tail(5)    # 3 → 5
+        # 0.1% tolerance
+        if any(recent_5["high"] > last_high * 0.999) and \
+           current_price < last_high * 1.001:
             buy_swept = True
+
     if sell_liquidity:
         last_low = sell_liquidity[-1]
-        recent_3 = df.tail(3)
-        if any(recent_3["low"] < last_low) and current_price > last_low:
+        recent_5 = df.tail(5)
+        if any(recent_5["low"] < last_low * 1.001) and \
+           current_price > last_low * 0.999:
             sell_swept = True
-    return {"buy_swept": buy_swept, "sell_swept": sell_swept}
 
+    return {
+        "buy_swept":  buy_swept,
+        "sell_swept": sell_swept,
+    }
 
 # ─────────────────────────────────────────────
 #  ORDER BLOCKS
@@ -330,36 +346,59 @@ def detect_order_blocks(df, lookback=20):
 # ─────────────────────────────────────────────
 #  FVG
 # ─────────────────────────────────────────────
-def detect_fvg(df, lookback=20):
-    fvgs          = []
+def detect_order_blocks(df, lookback=30):
+    """
+    Improved OB detection:
+    - Condition loose ki — 1.2x instead of 1.5x
+    - Price zone thoda bada — 0.1% tolerance
+    - More OBs detect honge
+    """
     recent        = df.tail(lookback).reset_index(drop=True)
     n             = len(recent)
     current_price = recent["close"].iloc[-1]
-    for i in range(2, n):
-        c1 = recent.iloc[i - 2]
-        c3 = recent.iloc[i]
-        if c1["high"] < c3["low"]:
-            gap_size = ((c3["low"] - c1["high"]) / c1["high"]) * 100
-            if gap_size >= 0.03:
-                fvgs.append({
-                    "type":   "BULL",
-                    "top":    round(c3["low"], 4),
-                    "bottom": round(c1["high"], 4),
-                    "retest": (current_price >= c1["high"] * 0.999 and
-                               current_price <= c3["low"] * 1.001),
-                })
-        elif c1["low"] > c3["high"]:
-            gap_size = ((c1["low"] - c3["high"]) / c3["high"]) * 100
-            if gap_size >= 0.03:
-                fvgs.append({
-                    "type":   "BEAR",
-                    "top":    round(c1["low"], 4),
-                    "bottom": round(c3["high"], 4),
-                    "retest": (current_price >= c3["high"] * 0.999 and
-                               current_price <= c1["low"] * 1.001),
-                })
-    return fvgs
+    bullish_obs   = []
+    bearish_obs   = []
 
+    for i in range(1, n - 1):
+        curr  = recent.iloc[i]
+        next_ = recent.iloc[i + 1]
+
+        curr_body = abs(curr["close"] - curr["open"])
+        next_body = abs(next_["close"] - next_["open"])
+
+        # Bearish OB — bullish candle phir bearish move
+        if (curr["close"] > curr["open"] and       # bullish candle
+                next_["close"] < next_["open"] and  # next bearish
+                next_body > curr_body * 1.2):        # 1.2x — loose condition
+            ob_top    = curr["high"]
+            ob_bottom = curr["open"]
+            # Price tolerance 0.1%
+            in_zone = (ob_bottom * 0.999 <= current_price <= ob_top * 1.001)
+            bearish_obs.append({
+                "top":         round(ob_top, 4),
+                "bottom":      round(ob_bottom, 4),
+                "price_in_ob": in_zone,
+                "fresh":       (i >= n - 8),
+            })
+
+        # Bullish OB — bearish candle phir bullish move
+        if (curr["close"] < curr["open"] and       # bearish candle
+                next_["close"] > next_["open"] and  # next bullish
+                next_body > curr_body * 1.2):        # 1.2x — loose condition
+            ob_top    = curr["open"]
+            ob_bottom = curr["low"]
+            in_zone   = (ob_bottom * 0.999 <= current_price <= ob_top * 1.001)
+            bullish_obs.append({
+                "top":         round(ob_top, 4),
+                "bottom":      round(ob_bottom, 4),
+                "price_in_ob": in_zone,
+                "fresh":       (i >= n - 8),
+            })
+
+    return {
+        "bullish_obs": bullish_obs[-5:],
+        "bearish_obs": bearish_obs[-5:],
+    }
 
 # ─────────────────────────────────────────────
 #  SMART MONEY SCORE
